@@ -1,56 +1,45 @@
 use std::{fs::File, io::Write};
 
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 #[tokio::main]
 async fn main() {
-    let (tx, rx) = mpsc::channel(2);
+    let (tx, rx) = mpsc::channel(1);
 
-    let manager = tokio::spawn(async move {
+    let file_task = tokio::spawn(async move {
         write_response_to_file(rx).await;
     });
 
-    let tx2 = tx.clone();
-    let t1 = tokio::spawn(async move {
-        println!("Starting a new therad");
-
-        tx.send("Line 1_1\n")
-            .await
-            .expect("There was an error while writing to the channel");
-
-        tx.send("Line 1_2\n")
-            .await
-            .expect("There was an error while writing to the channel");
-
-        println!("Data has been sent(therad 1)");
+    let request_task = tokio::spawn(async move {
+        request("https://fa.wikipedia.org/", tx).await;
     });
 
-    let t2 = tokio::spawn(async move {
-        println!("Starting a new therad");
-
-        tx2.send("Line 2_1\n")
-            .await
-            .expect("There was an error while writing to the channel");
-
-        tx2.send("Line 2_2\n")
-            .await
-            .expect("There was an error while writing to the channel");
-
-        println!("Data has been sent(therad 2)");
-    });
-
-    t1.await
-        .expect("There was an error while spawning one of the therads");
-    t2.await
-        .expect("There was an error while spawning one of the therads");
-    manager
+    file_task
         .await
-        .expect("There was an error while spawning the manager");
+        .expect("There was an error while spawning the file manager task");
+
+    request_task
+        .await
+        .expect("There was an error while starting the request task");
 }
 
-async fn write_response_to_file(mut input_channel: Receiver<&str>) {
+async fn request(url: &str, file_channel: Sender<String>) {
+    let response = reqwest::get(url)
+        .await
+        .expect("There was an error while requesting for the url")
+        .text()
+        .await
+        .expect("There was an error while readint the text from the result returned form the url");
+
+    file_channel
+        .send(response)
+        .await
+        .expect("There was an error while writing the response text to the channel");
+}
+
+async fn write_response_to_file(mut input_channel: Receiver<String>) {
     let mut file =
-        File::create("data.dat").expect("There was an error while creating the output file");
+        File::create("data.txt").expect("There was an error while creating the output file");
 
     while let Some(data) = input_channel.recv().await {
         println!("There is some new data {}", &data);
