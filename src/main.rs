@@ -11,7 +11,7 @@ use tokio::{
 
 #[tokio::main]
 async fn main() {
-    crawl("http://yazd.ac.ir/").await;
+    crawl("https://fa.wikipedia.org/").await;
 }
 
 async fn request(url: &str) -> String {
@@ -130,13 +130,19 @@ async fn url_pipeline(
             let url = format!("{}{}", domain, new_url);
             url
         } else {
-            new_url
+            if extract_domain(&new_url) == domain {
+                new_url
+            } else {
+                String::from("/")
+            }
         };
 
-        to_pool_from_thread
-            .send(new_url)
-            .await
-            .expect("There was an error while sending the url to the pool");
+        if new_url.starts_with("http") {
+            to_pool_from_thread
+                .send(new_url)
+                .await
+                .expect("There was an error while sending the url to the pool");
+        }
     }
 
     to_file_from_thread
