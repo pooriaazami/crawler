@@ -1,91 +1,93 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fs::File, io::Write, sync::Arc};
 
 use scraper::{Html, Selector};
 use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
     sync::{
         mpsc::{self, Receiver, Sender},
         Mutex,
     },
+    task::JoinHandle,
 };
 
 #[tokio::main]
 async fn main() {
-    let spider_task = tokio::spawn(async move {
-        spider("https://fa.wikipedia.org/".to_owned()).await;
-    });
-    println!("Spawning the spider task");
-    spider_task
-        .await
-        .expect("There was an error while spawing the spider");
+    crawl("http://yazd.ac.ir/").await;
 }
 
-async fn file_manager(mut rx: Receiver<String>) {
-    let mut output_file = File::create("output.txt")
-        .await
-        .expect("There was an error while opening the output file");
+async fn request(url: &str) -> String {
+    println!("Downloading {url}");
 
-    while let Some(html) = rx.recv().await {
-        output_file
-            .write_all(html.as_bytes())
-            .await
-            .expect("There was an error while writing to the output file");
-    }
-}
-
-async fn url_manager(mut rx: Receiver<String>, tx: Sender<String>) {
-    let all_urls = Arc::new(Mutex::new(HashSet::new()));
-    let queue = Arc::new(Mutex::new(Vec::new()));
-
-    let cloned_all_urls = all_urls.clone();
-    let cloned_queue = queue.clone();
-    let reader_task = tokio::spawn(async move {
-        println!("Restating the reader task");
-        while let Some(url) = rx.recv().await {
-            if url.starts_with("https://") {
-                let mut locked_all_urls = cloned_all_urls.lock().await;
-
-                if !locked_all_urls.contains(&url) {
-                    locked_all_urls.insert(url.clone());
-                    let mut locked_queue = cloned_queue.lock().await;
-                    locked_queue.push(url);
-                } else {
-                    println!("I have already seen this url");
-                }
-            }
-        }
-    });
-
-    let writer_task = tokio::spawn(async move {
-        loop {
-            let mut locked_queue = queue.lock().await;
-
-            if locked_queue.len() != 0 {
-                let url = locked_queue.remove(0);
-                tx //.blocking_send(url)
-                    .send(url)
-                    .await
-                    .expect("There was an error while writing the url to the channel");
-            }
-        }
-    });
-
-    reader_task
-        .await
-        .expect("There was an error while spawning the reader task");
-    writer_task
-        .await
-        .expect("There was an error while spawning the writer task");
-}
-
-async fn request(url: String) -> String {
     reqwest::get(url)
         .await
-        .expect("There was an error while waiting for the response")
+        .expect("There was an error while sending a request")
         .text()
         .await
-        .expect("There was an error while extracting the text")
+        .expect("There was an error while reading the html of the request")
+}
+
+async fn crawl(url: &str) {
+    let (to_thread_from_pool, mut from_pool_to_thread) = mpsc::channel(32);
+    let (to_pool_from_thread, from_thread_to_pool) = mpsc::channel(32);
+    let (to_file_from_thread, from_thread_to_file) = mpsc::channel(32);
+
+    let initial_request = to_pool_from_thread.clone();
+
+    let file_writer_task = tokio::spawn(async move {
+        write_to_file(from_thread_to_file).await;
+    });
+
+    let uniqueness_check_task = tokio::spawn(async move {
+        uniquness_cheker(to_thread_from_pool, from_thread_to_pool).await;
+    });
+
+    initial_request
+        .send(url.to_owned())
+        .await
+        .expect("There  as error while sending the first url to the pool");
+
+    let thread_pool = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+
+    let cloned_thread_pool = thread_pool.clone();
+    let thread_pool_pruner = tokio::spawn(async move {
+        loop {
+            let mut locked_thread_pool = cloned_thread_pool.lock().await;
+
+            let mut done_threads = Vec::new();
+            for (i, t) in locked_thread_pool.iter().enumerate() {
+                if t.is_finished() {
+                    done_threads.push(i);
+                }
+            }
+
+            for index in done_threads.iter() {
+                locked_thread_pool.remove(*index);
+            }
+        }
+    });
+    // println!("Starting....");
+    while let Some(url) = from_pool_to_thread.recv().await {
+        // println!("Start working on {url}");
+        let cloned_to_pool_from_thread = to_pool_from_thread.clone();
+        let cloned_to_file_from_thread = to_file_from_thread.clone();
+        let thread = tokio::spawn(async move {
+            url_pipeline(url, cloned_to_pool_from_thread, cloned_to_file_from_thread).await;
+        });
+        let mut locked_thread_pool = thread_pool.lock().await;
+
+        locked_thread_pool.push(thread);
+    }
+
+    thread_pool_pruner
+        .await
+        .expect("There was an error while waiting for the thread_pool_pruner to stop");
+
+    uniqueness_check_task
+        .await
+        .expect("There was an error while waiting for the uniqueness_check_task to stop");
+
+    file_writer_task
+        .await
+        .expect("There was an error while waiting for the file_writer_task to stop");
 }
 
 fn process(html: &str) -> Vec<String> {
@@ -114,62 +116,83 @@ fn extract_domain(url: &str) -> String {
     }
 }
 
-async fn spider(base_url: String) {
-    let count_inputs_to_the_channel = 32;
-    let (file_tx, file_rx) = mpsc::channel(1);
-    let (read_url_tx, mut read_url_rx) = mpsc::channel(1);
-    let (write_url_tx, write_url_rx) = mpsc::channel(count_inputs_to_the_channel);
+async fn url_pipeline(
+    url: String,
+    to_pool_from_thread: Sender<String>,
+    to_file_from_thread: Sender<String>,
+) {
+    let response = request(&url).await;
+    let domain = extract_domain(&url);
 
-    let file_manager_task = tokio::spawn(async move { file_manager(file_rx).await });
+    let urls = process(&response);
+    for new_url in urls {
+        let new_url = if new_url.starts_with("/") {
+            let url = format!("{}{}", domain, new_url);
+            url
+        } else {
+            new_url
+        };
 
-    let write_url_tx_starter = write_url_tx.clone();
-    let url_manager_task = tokio::spawn(async move {
-        write_url_tx_starter
-            .clone()
-            .send(base_url)
+        to_pool_from_thread
+            .send(new_url)
             .await
-            .expect("Theer was an error while sending base_url to the channel");
-
-        url_manager(write_url_rx, read_url_tx).await;
-    });
-
-    while let Some(url) = read_url_rx.recv().await {
-        println!("Crawling {}", &url);
-
-        let domain = extract_domain(&url);
-
-        let response = request(url).await;
-        let urls = process(&response);
-
-        for new_url in urls {
-            let new_url = if new_url.starts_with("/") {
-                let url = format!("{}{}", domain, new_url);
-                url
-            } else {
-                new_url
-            };
-
-            let cloned_write_url_tx = write_url_tx.clone();
-            tokio::spawn(async move {
-                cloned_write_url_tx
-                    .clone()
-                    .send(new_url)
-                    .await
-                    .expect("There was an error while sending the url to the channel");
-            });
-        }
-
-        file_tx
-            .send(response)
-            .await
-            .expect("There was ana error while sending the html to file writer task");
+            .expect("There was an error while sending the url to the pool");
     }
 
-    url_manager_task
+    to_file_from_thread
+        .send(response)
         .await
-        .expect("There was an error while spawning the url manager task");
+        .expect("There was an error while send html to the channel to e wtite to the file");
+}
 
-    file_manager_task
+async fn write_to_file(mut rx: Receiver<String>) {
+    let mut file =
+        File::create("output.txt").expect("There was an error while creating the output file");
+
+    while let Some(html) = rx.recv().await {
+        file.write_all(html.as_bytes())
+            .expect("There was an error while wariting data to the output file");
+
+        file.flush()
+            .expect("There was an error while flushing the output file");
+    }
+}
+
+async fn uniquness_cheker(tx: Sender<String>, mut rx: Receiver<String>) {
+    let url_memory = Arc::new(Mutex::new(HashSet::new()));
+    let url_queue = Arc::new(Mutex::new(Vec::new()));
+
+    let read_url_memory = url_memory.clone();
+    let read_url_queue = url_queue.clone();
+
+    let read_task = tokio::spawn(async move {
+        let mut locked_url_memory = read_url_memory.lock().await;
+        // let mut locked_url_queue = read_url_queue.lock().await;
+
+        while let Some(url) = rx.recv().await {
+            if !locked_url_memory.contains(&url) {
+                locked_url_memory.insert(url.clone());
+                read_url_queue.lock().await.push(url);
+            }
+        }
+    });
+
+    let read_url_queue = url_queue.clone();
+
+    let write_task = tokio::spawn(async move {
+        loop {
+            let mut locked_url_queue = read_url_queue.lock().await;
+            if locked_url_queue.len() != 0 {
+                tx.send(locked_url_queue.remove(0)).await.expect("There was an error while waiting for the channel to send url outside the url_pool");
+            }
+        }
+    });
+
+    read_task
         .await
-        .expect("There was an error while spawning the file manager task");
+        .expect("There was an error while waiting for the read_task to stop");
+
+    write_task
+        .await
+        .expect("There was an error while waiting for the write_task to stop");
 }
