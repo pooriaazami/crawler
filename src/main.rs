@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs::File, io::Write, sync::Arc};
+use std::{collections::HashSet, fs::File, io::Write, sync::Arc, time::Duration};
 
 use scraper::{Html, Selector};
 use tokio::{
@@ -11,13 +11,24 @@ use tokio::{
 
 #[tokio::main]
 async fn main() {
-    crawl("https://fa.wikipedia.org/").await;
+    crawl("https://quotes.toscrape.com/").await;
 }
 
 async fn request(url: &str) -> String {
-    println!("Downloading {url}");
+    // println!("Downloading {url}");
 
-    reqwest::get(url)
+    // reqwest::get(url)
+    //     .await
+    //     .expect("There was an error while sending a request")
+    //     .text()
+    //     .await
+    //     .expect("There was an error while reading the html of the request")
+    reqwest::ClientBuilder::new()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("There was an error while building the client")
+        .get(url)
+        .send()
         .await
         .expect("There was an error while sending a request")
         .text()
@@ -52,16 +63,22 @@ async fn crawl(url: &str) {
         loop {
             let mut locked_thread_pool = cloned_thread_pool.lock().await;
 
-            let mut done_threads = Vec::new();
+            let mut done_threads = HashSet::new();
             for (i, t) in locked_thread_pool.iter().enumerate() {
                 if t.is_finished() {
-                    done_threads.push(i);
+                    done_threads.insert(i);
                 }
             }
 
-            for index in done_threads.iter() {
-                locked_thread_pool.remove(*index);
+            for index in 0..locked_thread_pool.len() {
+                if done_threads.contains(&index) {
+                    locked_thread_pool.remove(index);
+                    // println!("Removing a thread...");
+                }
             }
+
+
+            println!("Size of the pool: {}", locked_thread_pool.len());
         }
     });
     // println!("Starting....");
