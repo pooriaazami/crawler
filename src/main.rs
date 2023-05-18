@@ -25,12 +25,6 @@ async fn main() {
 async fn request(url: &str) -> String {
     println!("Downloading {url}");
 
-    // reqwest::get(url)
-    //     .await
-    //     .expect("There was an error while sending a request")
-    //     .text()
-    //     .await
-    //     .expect("There was an error while reading the html of the request")
     reqwest::ClientBuilder::new()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -70,7 +64,6 @@ async fn crawl(url: &str) {
 
     let cloned_thread_pool = thread_pool.clone();
     let thread_pool_pruner = tokio::spawn(async move {
-        // let mut check = false;
         loop {
             let mut locked_thread_pool = cloned_thread_pool.lock().await;
 
@@ -78,25 +71,18 @@ async fn crawl(url: &str) {
             for (i, t) in locked_thread_pool.iter().enumerate() {
                 if t.is_finished() {
                     done_threads.insert(i);
-                    // check = true
                 }
             }
 
             for index in 0..locked_thread_pool.len() {
                 if done_threads.contains(&index) {
                     locked_thread_pool.remove(index);
-                    // println!("Removing a thread...");
                 }
             }
-
-            // if check && locked_thread_pool.len() == 0 {
-            //     process::exit(0);
-            // }
         }
     });
-    // println!("Starting....");
+
     while let Some(url) = from_pool_to_thread.recv().await {
-        // println!("Start working on {url}");
         let cloned_to_pool_from_thread = to_pool_from_thread.clone();
         let cloned_to_file_from_thread = to_file_from_thread.clone();
         let thread = tokio::spawn(async move {
@@ -167,10 +153,7 @@ async fn url_pipeline(
             }
         };
 
-        // println!("Generated url: {}", new_url);
-
         if new_url.starts_with("http") {
-            // println!("Sending {} to the url_pool", &new_url);
             to_pool_from_thread
                 .send(new_url)
                 .await
@@ -209,11 +192,9 @@ async fn uniquness_cheker(tx: Sender<String>, mut rx: Receiver<String>) {
 
     let read_task = tokio::spawn(async move {
         let mut locked_url_memory = read_url_memory.lock().await;
-        // let mut locked_url_queue = read_url_queue.lock().await;
 
         while let Some(url) = rx.recv().await {
             if !locked_url_memory.contains(&url) {
-                // println!("Adding {} to the url_pool", &url);
                 locked_url_memory.insert(url.clone());
                 read_url_queue.lock().await.push(url);
             }
@@ -227,7 +208,6 @@ async fn uniquness_cheker(tx: Sender<String>, mut rx: Receiver<String>) {
             let mut locked_url_queue = read_url_queue.lock().await;
             if locked_url_queue.len() != 0 {
                 let url = locked_url_queue.remove(0);
-                // println!("Sending {} to the downloader", &url);
                 tx.send(url).await.expect("There was an error while waiting for the channel to send url outside the url_pool");
             }
         }
